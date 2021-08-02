@@ -6,6 +6,7 @@ package handlers
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"net"
 	"net/http"
@@ -44,16 +45,20 @@ func (h MethodHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 }
 
 // responseLogger is wrapper of http.ResponseWriter that keeps track of its HTTP
-// status code and body size
+// status code, body size, and optionally its response body.
 type responseLogger struct {
-	w      http.ResponseWriter
-	status int
-	size   int
+	w               http.ResponseWriter
+	responseBodyBuf *bytes.Buffer
+	status          int
+	size            int
 }
 
 func (l *responseLogger) Write(b []byte) (int, error) {
 	size, err := l.w.Write(b)
 	l.size += size
+	if l.responseBodyBuf != nil {
+		l.responseBodyBuf.Write(b)
+	}
 	return size, err
 }
 

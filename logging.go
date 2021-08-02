@@ -5,6 +5,7 @@
 package handlers
 
 import (
+	"bytes"
 	"io"
 	"net"
 	"net/http"
@@ -20,11 +21,12 @@ import (
 
 // LogFormatterParams is the structure any formatter will be handed when time to log comes
 type LogFormatterParams struct {
-	Request    *http.Request
-	URL        url.URL
-	TimeStamp  time.Time
-	StatusCode int
-	Size       int
+	Request      *http.Request
+	URL          url.URL
+	TimeStamp    time.Time
+	StatusCode   int
+	Size         int
+	ResponseBody []byte
 }
 
 // LogFormatter gives the signature of the formatter function passed to CustomLoggingHandler
@@ -34,19 +36,27 @@ type LogFormatter func(writer io.Writer, params LogFormatterParams)
 // friends
 
 type loggingHandler struct {
-	writer    io.Writer
-	handler   http.Handler
-	formatter LogFormatter
+	writer              io.Writer
+	handler             http.Handler
+	formatter           LogFormatter
+	includeResponseBody bool
+	onlyUnauthorized    bool
 }
 
 func (h loggingHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	t := time.Now()
-	logger, w := makeLogger(w)
+	logger, w := makeLogger(w, h.includeResponseBody)
 	url := *req.URL
 
 	h.handler.ServeHTTP(w, req)
 	if req.MultipartForm != nil {
-		req.MultipartForm.RemoveAll()
+		_ = req.MultipartForm.RemoveAll()
+	}
+
+	if h.onlyUnauthorized {
+		if logger.Status() != http.StatusUnauthorized {
+			return
+		}
 	}
 
 	params := LogFormatterParams{
@@ -57,11 +67,18 @@ func (h loggingHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		Size:       logger.Size(),
 	}
 
+	if logger.responseBodyBuf != nil {
+		params.ResponseBody = logger.responseBodyBuf.Bytes()
+	}
+
 	h.formatter(h.writer, params)
 }
 
-func makeLogger(w http.ResponseWriter) (*responseLogger, http.ResponseWriter) {
+func makeLogger(w http.ResponseWriter, includeResponseBody bool) (*responseLogger, http.ResponseWriter) {
 	logger := &responseLogger{w: w, status: http.StatusOK}
+	if includeResponseBody {
+		logger.responseBodyBuf = new(bytes.Buffer)
+	}
 	return logger, httpsnoop.Wrap(w, httpsnoop.Hooks{
 		Write: func(httpsnoop.WriteFunc) httpsnoop.WriteFunc {
 			return logger.Write
@@ -191,7 +208,7 @@ func buildCommonLogLine(req *http.Request, url url.URL, ts time.Time, status int
 func writeLog(writer io.Writer, params LogFormatterParams) {
 	buf := buildCommonLogLine(params.Request, params.URL, params.TimeStamp, params.StatusCode, params.Size)
 	buf = append(buf, '\n')
-	writer.Write(buf)
+	_, _ = writer.Write(buf)
 }
 
 // writeCombinedLog writes a log entry for req to w in Apache Combined Log Format.
@@ -204,7 +221,7 @@ func writeCombinedLog(writer io.Writer, params LogFormatterParams) {
 	buf = append(buf, `" "`...)
 	buf = appendQuoted(buf, params.Request.UserAgent())
 	buf = append(buf, '"', '\n')
-	writer.Write(buf)
+	_, _ = writer.Write(buf)
 }
 
 // CombinedLoggingHandler return a http.Handler that wraps h and logs requests to out in
@@ -214,7 +231,13 @@ func writeCombinedLog(writer io.Writer, params LogFormatterParams) {
 //
 // LoggingHandler always sets the ident field of the log to -
 func CombinedLoggingHandler(out io.Writer, h http.Handler) http.Handler {
-	return loggingHandler{out, h, writeCombinedLog}
+	return loggingHandler{
+		out,
+		h,
+		writeCombinedLog,
+		false,
+		false,
+	}
 }
 
 // LoggingHandler return a http.Handler that wraps h and logs requests to out in
@@ -234,11 +257,51 @@ func CombinedLoggingHandler(out io.Writer, h http.Handler) http.Handler {
 //  http.ListenAndServe(":1123", loggedRouter)
 //
 func LoggingHandler(out io.Writer, h http.Handler) http.Handler {
-	return loggingHandler{out, h, writeLog}
+	return loggingHandler{
+		out,
+		h,
+		writeLog,
+		false,
+		false,
+	}
 }
 
 // CustomLoggingHandler provides a way to supply a custom log formatter
 // while taking advantage of the mechanisms in this package
 func CustomLoggingHandler(out io.Writer, h http.Handler, f LogFormatter) http.Handler {
-	return loggingHandler{out, h, f}
+	return loggingHandler{
+		out,
+		h,
+		f,
+		false,
+		false,
+	}
+}
+
+// CustomLoggingHandlerWithOptions provides a way to supply a custom log formatter
+// while taking advantage of the mechanisms in this package
+func CustomLoggingHandlerWithOptions(out io.Writer, h http.Handler, f LogFormatter, options ...func(*loggingHandler)) http.Handler {
+	handler := loggingHandler{
+		out,
+		h,
+		f,
+		false,
+		false,
+	}
+	for _, o := range options {
+		o(&handler)
+	}
+	return handler
+}
+
+func WithResponseBody() func(*loggingHandler) {
+	return func(handler *loggingHandler) {
+		handler.includeResponseBody = true
+	}
+}
+
+func OnlyLogUnauthorized() func(*loggingHandler) {
+	return func(handler *loggingHandler) {
+		handler.onlyUnauthorized = true
+	}
 }

@@ -8,7 +8,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math/rand"
 	"mime/multipart"
 	"net/http"
@@ -23,7 +23,7 @@ import (
 
 func TestMakeLogger(t *testing.T) {
 	rec := httptest.NewRecorder()
-	logger, w := makeLogger(rec)
+	logger, w := makeLogger(rec, false)
 	// initial status
 	if logger.Status() != http.StatusOK {
 		t.Fatalf("wrong status, got %d want %d", logger.Status(), http.StatusOK)
@@ -34,7 +34,7 @@ func TestMakeLogger(t *testing.T) {
 		t.Fatalf("wrong status, got %d want %d", logger.Status(), http.StatusInternalServerError)
 	}
 	// Write
-	w.Write([]byte(ok))
+	_, _ = w.Write([]byte(ok))
 	if logger.Size() != len(ok) {
 		t.Fatalf("wrong size, got %d want %d", logger.Size(), len(ok))
 	}
@@ -68,7 +68,7 @@ Content-Disposition: form-data; name="buzz"; filename="example.txt"
 		t.Fatalf("Failed to read multipart form: %v", err)
 	}
 
-	tmpFiles, err := ioutil.ReadDir(os.TempDir())
+	tmpFiles, err := os.ReadDir(os.TempDir())
 	if err != nil {
 		t.Fatalf("Failed to list %s: %v", os.TempDir(), err)
 	}
@@ -80,14 +80,13 @@ Content-Disposition: form-data; name="buzz"; filename="example.txt"
 		}
 
 		path := filepath.Join(os.TempDir(), f.Name())
-		switch b, err := ioutil.ReadFile(path); {
+		switch b, err := os.ReadFile(path); {
 		case err != nil:
 			t.Fatalf("Failed to read %s: %v", path, err)
 		case string(b) != contents:
 			continue
 		default:
 			tmpFile = path
-			break
 		}
 	}
 
@@ -124,6 +123,73 @@ func TestLogPathRewrites(t *testing.T) {
 
 	if !strings.Contains(buf.String(), "GET /subdir/asdf HTTP") {
 		t.Fatalf("Got log %#v, wanted substring %#v", buf.String(), "GET /subdir/asdf HTTP")
+	}
+}
+
+func TestCustomLoggingHandlerWithOptions_WithResponseBody(t *testing.T) {
+	const responseBodyString = "custom response\n"
+	var buf bytes.Buffer
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		req.URL.Path = "/" // simulate http.StripPrefix and friends
+		_, _ = w.Write([]byte(responseBodyString))
+		w.WriteHeader(200)
+	})
+
+	f := func(writer io.Writer, params LogFormatterParams) {
+		_, _ = writer.Write(params.ResponseBody)
+	}
+
+	logger := CustomLoggingHandlerWithOptions(&buf, handler, f, WithResponseBody())
+
+	logger.ServeHTTP(httptest.NewRecorder(), newRequest("GET", "/subdir/asdf"))
+
+	if !strings.Contains(buf.String(), responseBodyString) {
+		t.Fatalf("Got log %#v, wanted substring %#v", buf.String(), responseBodyString)
+	}
+}
+
+func TestCustomLoggingHandlerWithOptions_OnlyLogUnauthorized_LogsUnauthorizedRequests(t *testing.T) {
+	const log = "unauthorized"
+	var buf bytes.Buffer
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		req.URL.Path = "/" // simulate http.StripPrefix and friends
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+
+	f := func(writer io.Writer, params LogFormatterParams) {
+		_, _ = writer.Write([]byte(log))
+	}
+
+	logger := CustomLoggingHandlerWithOptions(&buf, handler, f, OnlyLogUnauthorized())
+
+	logger.ServeHTTP(httptest.NewRecorder(), newRequest("GET", "/subdir/asdf"))
+
+	if !strings.Contains(buf.String(), log) {
+		t.Fatalf("Got log %#v, wanted substring %#v", buf.String(), log)
+	}
+}
+
+func TestCustomLoggingHandlerWithOptions_OnlyLogUnauthorized_DoesNotLogAuthorizedRequests(t *testing.T) {
+	const log = "unauthorized"
+	var buf bytes.Buffer
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		req.URL.Path = "/" // simulate http.StripPrefix and friends
+		w.WriteHeader(http.StatusOK)
+	})
+
+	f := func(writer io.Writer, params LogFormatterParams) {
+		_, _ = writer.Write([]byte(log))
+	}
+
+	logger := CustomLoggingHandlerWithOptions(&buf, handler, f, OnlyLogUnauthorized())
+
+	logger.ServeHTTP(httptest.NewRecorder(), newRequest("GET", "/subdir/asdf"))
+
+	if buf.Len() > 0 {
+		t.Fatalf("Expected no logs to be produced, but got %#v", buf.String())
 	}
 }
 
